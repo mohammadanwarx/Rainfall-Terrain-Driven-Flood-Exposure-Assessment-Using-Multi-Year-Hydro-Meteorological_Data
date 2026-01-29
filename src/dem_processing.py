@@ -19,7 +19,7 @@ def load_dem(filepath: str) -> Tuple[np.ndarray, dict]:
     ----------
     filepath : str
         Path to the DEM raster file
-        
+    
     Returns
     -------
     Tuple[np.ndarray, dict]
@@ -45,10 +45,29 @@ def fill_depressions(dem: np.ndarray) -> np.ndarray:
     np.ndarray
         Depression-filled DEM
     """
-    # Placeholder for depression filling algorithm
-    filled_dem = dem.copy()
-    # TODO: Implement depression filling algorithm
-    return filled_dem
+    # Simple iterative pit filling: raise any cell lower than all 8 neighbors
+    # to the minimum of its neighbors. This is a basic approach and may be
+    # slow for large rasters compared to specialized hydrology libraries.
+    filled = dem.astype(float, copy=True)
+    valid = np.isfinite(filled)
+
+    max_iter = 1000
+    for _ in range(max_iter):
+        padded = np.pad(filled, 1, mode="edge")
+        neighbors = [
+            padded[:-2, :-2], padded[:-2, 1:-1], padded[:-2, 2:],
+            padded[1:-1, :-2],                     padded[1:-1, 2:],
+            padded[2:, :-2],  padded[2:, 1:-1],  padded[2:, 2:]
+        ]
+        neighbor_min = np.minimum.reduce(neighbors)
+
+        pits = valid & (filled < neighbor_min)
+        if not np.any(pits):
+            break
+
+        filled[pits] = neighbor_min[pits]
+
+    return filled
 
 
 def calculate_slope(dem: np.ndarray, cellsize: float) -> np.ndarray:
