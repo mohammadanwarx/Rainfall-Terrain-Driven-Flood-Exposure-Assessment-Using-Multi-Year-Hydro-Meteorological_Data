@@ -163,6 +163,25 @@ class GeospatialCube:
             'median': float(data_array.median().values)
         }
     
+    def to_numpy(self, variable: str) -> np.ndarray:
+        """
+        Convert a variable in the cube to a NumPy array.
+        
+        Parameters
+        ----------
+        variable : str
+            Variable name to extract
+            
+        Returns
+        -------
+        np.ndarray
+            NumPy array of the variable data
+        """
+        if variable not in self.data:
+            raise ValueError(f"Variable {variable} not found in cube")
+        
+        return self.data[variable].values
+    
     def save(self, filepath: str, format: str = 'netcdf'):
         """
         Save cube to file.

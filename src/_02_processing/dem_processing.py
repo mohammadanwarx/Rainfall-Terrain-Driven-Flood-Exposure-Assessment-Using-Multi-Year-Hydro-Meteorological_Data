@@ -100,23 +100,120 @@ def calculate_slope(dem: np.ndarray, cellsize: float) -> np.ndarray:
     return slope
 
 
-def resample_dem(dem: np.ndarray, metadata: dict, target_resolution: float) -> Tuple[np.ndarray, dict]:
+def save_raster(array: np.ndarray, metadata: dict, output_path: str) -> None:
     """
-    Resample DEM to target resolution.
-    
+    Save a NumPy array as a GeoTIFF raster.
+
     Parameters
     ----------
-    dem : np.ndarray
-        Input DEM array
+    array : np.ndarray
+        Array to save
     metadata : dict
-        Raster metadata
-    target_resolution : float
-        Target resolution in meters
-        
+        Raster metadata from original file
+    output_path : str
+        Path to save the output file
+    """
+    if not HAS_RASTERIO:
+        raise ImportError("rasterio required. Install: pip install rasterio")
+
+    from pathlib import Path
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    meta = metadata.copy()
+    meta.update({'dtype': array.dtype, 'count': 1})
+
+    with rasterio.open(output_path, 'w', **meta) as dst:
+        dst.write(array, 1)
+    print(f"✓ Saved: {output_path}")
+
+
+def process_dem(input_path: str, output_dir: str, cellsize: float = 30.0) -> dict:
+    """
+    Process DEM: fill depressions, calculate slope, and save results.
+
+    Parameters
+    ----------
+    input_path : str
+        Path to input DEM file
+    output_dir : str
+        Directory to save processed outputs
+    cellsize : float
+        Cell size in meters (default: 30m)
+
     Returns
     -------
-    Tuple[np.ndarray, dict]
-        Resampled DEM and updated metadata
+    dict
+        Dictionary with paths to output files
     """
-    # TODO: Implement resampling
-    return dem, metadata
+    from pathlib import Path
+
+    print("=" * 50)
+    print("DEM PROCESSING")
+    print("=" * 50)
+
+    # Load DEM
+    print(f"\nLoading DEM: {input_path}")
+    dem, metadata = load_dem(input_path)
+    print(f"  Shape: {dem.shape}")
+
+    # Fill depressions
+    print("\nFilling depressions...")
+    filled = fill_depressions(dem)
+
+    # Calculate slope
+    print("Calculating slope...")
+    slope = calculate_slope(filled, cellsize)
+
+    # Save outputs
+    output_dir = Path(output_dir)
+    filled_path = str(output_dir / "dem_filled.tif")
+    slope_path = str(output_dir / "slope.tif")
+
+    print("\nSaving outputs...")
+    save_raster(filled.astype(np.float32), metadata, filled_path)
+    save_raster(slope.astype(np.float32), metadata, slope_path)
+
+    print("\n✓ Processing complete!")
+
+    return {
+        'filled_dem': filled_path,
+        'slope': slope_path
+    }
+
+
+#==================
+# Run DEM processing when executed as script
+'''
+this is a usage for above functions, Dem.tif been used and callculate the fill and  slope
+and it saves the both raster files
+
+'''
+if __name__ == "__main__":
+    from pathlib import Path
+    import sys
+
+    # Determine base directory
+    try:
+        base_dir = Path(__file__).parent.parent.parent
+    except NameError:
+        base_dir = Path.cwd()
+        if not (base_dir / "data").exists():
+            for parent in [base_dir.parent, base_dir.parent.parent]:
+                if (parent / "data").exists():
+                    base_dir = parent
+                    break
+
+    # Define paths
+    input_path = base_dir / "data" / "raw" / "raster" / "DEM2.tif"
+    output_dir = base_dir / "data" / "processed"
+
+    print(f"Base Directory: {base_dir}")
+    print(f"Input DEM: {input_path}")
+    print(f"Output Directory: {output_dir}")
+
+    # Run processing
+    results = process_dem(str(input_path), str(output_dir), cellsize=30)
+
+    print(f"\nOutputs:")
+    for name, path in results.items():
+        print(f"  {name}: {path}")

@@ -29,7 +29,8 @@ from .dem_processing import (
     load_dem,
     fill_depressions,
     calculate_slope,
-    resample_dem,
+    save_raster,
+    process_dem,
 )
 
 __all__ = [
@@ -51,5 +52,6 @@ __all__ = [
     "load_dem",
     "fill_depressions",
     "calculate_slope",
-    "resample_dem",
+    "save_raster",
+    "process_dem",
 ]

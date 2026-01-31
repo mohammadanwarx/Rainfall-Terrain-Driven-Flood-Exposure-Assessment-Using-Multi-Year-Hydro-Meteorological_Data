@@ -103,8 +103,18 @@ class CHIRPSProcessor:
         self.datacube = clipped
         return clipped
     
-    def process_chirps_for_aoi(self, save_path: Optional[Union[str, Path]] = None) -> xr.Dataset:
-        """Complete workflow: merge CHIRPS files and clip to AOI."""
+    def process_chirps_for_aoi(self, save_path: Optional[Union[str, Path]] = None, 
+                                overwrite: bool = False) -> xr.Dataset:
+        """
+        Complete workflow: merge CHIRPS files and clip to AOI.
+        
+        Parameters
+        ----------
+        save_path : Optional[Union[str, Path]]
+            Path to save the clipped datacube
+        overwrite : bool
+            If True, overwrite existing file. If False, skip if file exists.
+        """
         print("="*60)
         print("CHIRPS Rainfall Processing Workflow")
         print("="*60)
@@ -116,8 +126,13 @@ class CHIRPSProcessor:
         if save_path:
             save_path = Path(save_path)
             save_path.parent.mkdir(parents=True, exist_ok=True)
-            print(f"\nSaving to: {save_path}")
-            self.datacube.to_netcdf(save_path)
+            
+            if save_path.exists() and save_path.stat().st_size > 0 and not overwrite:
+                print(f"\n⚠ File already exists: {save_path}")
+                print("  Use overwrite=True to replace it.")
+            else:
+                print(f"\nSaving to: {save_path}")
+                self.datacube.to_netcdf(save_path)
         
         print("\nProcessing Complete!")
         return self.datacube
@@ -138,9 +153,26 @@ def create_rainfall_datacube(chirps_dir: Union[str, Path],
 if __name__ == "__main__":
     from pathlib import Path
     import sys
+    import os
+    
+    # Determine base directory - works both as script and in interactive mode
+    try:
+        # When running as a script
+        base_dir = Path(__file__).parent.parent.parent
+    except NameError:
+        # When running interactively (e.g., in Python REPL or Jupyter)
+        # Assumes current working directory is the project root
+        base_dir = Path.cwd()
+        # If we're in a subdirectory, try to find project root
+        if not (base_dir / "data").exists():
+            # Try common locations
+            for parent in [base_dir.parent, base_dir.parent.parent, base_dir.parent.parent.parent]:
+                if (parent / "data").exists():
+                    base_dir = parent
+                    break
     
     # Add parent directory to path for imports
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    sys.path.insert(0, str(base_dir))
     
     # Import processing modules for cubes and tensors
     from src._02_processing.cubes import GeospatialCube
@@ -149,7 +181,6 @@ if __name__ == "__main__":
     # ==========================================================================
     # STEP 1: Define paths
     # ==========================================================================
-    base_dir = Path(__file__).parent.parent.parent
     chirps_dir = base_dir / "data" / "raw" / "raster" / "Chirps_rainfall"
     aoi_path = base_dir / "data" / "raw" / "vector" / "AOI.shp"
     output_path = base_dir / "data" / "processed" / "chirps_clipped_aoi.nc"
@@ -157,7 +188,8 @@ if __name__ == "__main__":
     print("=" * 70)
     print("CHIRPS RAINFALL DATA - LOAD AND CLIP TO AOI")
     print("=" * 70)
-    print(f"\nCHIRPS Directory: {chirps_dir}")
+    print(f"\nBase Directory: {base_dir}")
+    print(f"CHIRPS Directory: {chirps_dir}")
     print(f"AOI Shapefile: {aoi_path}")
     print(f"Output Path: {output_path}")
     
@@ -184,14 +216,28 @@ if __name__ == "__main__":
     clipped_datacube = processor.clip_to_aoi()
     print(f"Clipped Datacube Dimensions: {dict(clipped_datacube.sizes)}")
     
-    # Delete existing file if it exists
-    if output_path.exists():
-        output_path.unlink()
-    
-    # Save to netCDF
+    # Save to netCDF - check if file exists first
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    clipped_datacube.to_netcdf(output_path)
-    print(f"\nSaved clipped datacube to: {output_path}")
+    if output_path.exists() and output_path.stat().st_size > 0:
+        print(f"\n⚠ File already exists: {output_path}")
+        print(f"  File size: {output_path.stat().st_size / 1024:.1f} KB")
+        print("  Skipping save. Delete the file manually if you want to overwrite.")
+    else:
+        # If file exists but is empty (0 bytes), delete it first
+        if output_path.exists() and output_path.stat().st_size == 0:
+            try:
+                output_path.unlink()
+                print(f"  Deleted empty file: {output_path}")
+            except PermissionError:
+                print(f"\n⚠ Cannot delete locked file: {output_path}")
+                print("  Please close any notebooks or applications using this file.")
+                
+        try:
+            clipped_datacube.to_netcdf(output_path, mode='w')
+            print(f"\n✓ Saved clipped datacube to: {output_path}")
+        except PermissionError:
+            print(f"\n⚠ Cannot save - file is locked: {output_path}")
+            print("  Please close the Visulization.ipynb notebook and try again.")
     
     # ==========================================================================
     # STEP 3: Use GeospatialCube for datacube operations
@@ -240,13 +286,16 @@ if __name__ == "__main__":
     normalized = normalize_tensor(rainfall_array)
     print(f"\nNormalized Tensor Range: [{normalized.min():.4f}, {normalized.max():.4f}]")
     
-    # Calculate tensor statistics
+    # Calculate tensor statistics (returns per-band/time-step statistics)
     tensor_stats = calculate_tensor_statistics(rainfall_array)
-    print(f"\nTensor Statistics:")
-    print(f"  Mean: {tensor_stats['mean']:.2f} mm")
-    print(f"  Std: {tensor_stats['std']:.2f} mm")
-    print(f"  Min: {tensor_stats['min']:.2f} mm")
-    print(f"  Max: {tensor_stats['max']:.2f} mm")
+    print(f"\nTensor Statistics (per time step): {len(tensor_stats)} bands")
+    
+    # Calculate overall statistics
+    print(f"\nOverall Rainfall Statistics:")
+    print(f"  Mean: {np.nanmean(rainfall_array):.2f} mm")
+    print(f"  Std: {np.nanstd(rainfall_array):.2f} mm")
+    print(f"  Min: {np.nanmin(rainfall_array):.2f} mm")
+    print(f"  Max: {np.nanmax(rainfall_array):.2f} mm")
     
     # ==========================================================================
     # SUMMARY
@@ -258,4 +307,7 @@ if __name__ == "__main__":
     print(f"✓ Clipped to AOI: {aoi.total_bounds}")
     print(f"✓ Created datacube: {dict(clipped_datacube.dims)}")
     print(f"✓ Saved to: {output_path}")
-    print(f"✓ File size: {output_path.stat().st_size / 1024:.1f} KB")
+    try:
+        print(f"✓ File size: {output_path.stat().st_size / 1024:.1f} KB")
+    except:
+        print(f"✓ Output saved (file size check skipped)")
