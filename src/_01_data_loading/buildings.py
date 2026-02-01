@@ -406,6 +406,108 @@ def load_buildings(filepath: str) -> gpd.GeoDataFrame:
     logger.info(f"Loaded {len(gdf)} buildings from {filepath}")
     return gdf
 
+
+
+# ===============================================
+# Population Estimation Functions
+# ===============================================
+
+def estimate_population_from_buildings(buildings_gdf: gpd.GeoDataFrame, 
+                                       household_size: int = 6) -> pd.Series:
+    """
+    Estimate population from building count using household size assumption.
+    
+    ASSUMPTION: 
+    -----------
+    - One household per building
+    - Average household size = 6 persons (default, customizable)
+    - Linear population estimation: Population = N_buildings × household_size
+    
+    This is a simplified approach suitable for areas lacking detailed population data.
+    Assumes residential use for all buildings; can be refined with building type filters.
+    
+    Parameters
+    ----------
+    buildings_gdf : gpd.GeoDataFrame
+        GeoDataFrame containing building geometries and attributes
+    household_size : int, optional
+        Average persons per household per building (default: 6)
+        Based on regional demographic data
+        
+    Returns
+    -------
+    pd.Series
+        Estimated population per building
+        
+    Raises
+    ------
+    ValueError
+        If GeoDataFrame is empty or household_size <= 0
+        
+    Notes
+    -----
+    In production use, this should be refined with:
+    - Building type classification (residential, commercial, etc.)
+    - Building area/footprint size weighting
+    - Known population census data for calibration
+    
+    Examples
+    --------
+    >>> buildings_gdf['population'] = estimate_population_from_buildings(buildings_gdf)
+    >>> total_pop = buildings_gdf['population'].sum()
+    """
+    if buildings_gdf.empty:
+        raise ValueError("GeoDataFrame is empty. Cannot estimate population.")
+    
+    if household_size <= 0:
+        raise ValueError(f"household_size must be positive, got {household_size}")
+    
+    # Create population column: one household per building
+    population = pd.Series([household_size] * len(buildings_gdf), 
+                          index=buildings_gdf.index)
+    
+    logger.info(
+        f"Estimated population from {len(buildings_gdf)} buildings: "
+        f"Total = {population.sum()} persons "
+        f"(assumption: {household_size} persons/building)"
+    )
+    
+    return population
+
+
+def add_population_attribute(buildings_gdf: gpd.GeoDataFrame, 
+                            household_size: int = 6) -> gpd.GeoDataFrame:
+    """
+    Add estimated population as a column to buildings GeoDataFrame.
+    
+    Parameters
+    ----------
+    buildings_gdf : gpd.GeoDataFrame
+        Input GeoDataFrame
+    household_size : int, optional
+        Average household size (default: 6)
+        
+    Returns
+    -------
+    gpd.GeoDataFrame
+        GeoDataFrame with 'population' column added
+        
+    Examples
+    --------
+    >>> buildings_with_pop = add_population_attribute(buildings_gdf, household_size=6)
+    """
+    gdf = buildings_gdf.copy()
+    gdf['population'] = estimate_population_from_buildings(gdf, household_size)
+    
+    logger.info(
+        f"Added population attribute to {len(gdf)} buildings. "
+        f"Total population: {gdf['population'].sum()}"
+    )
+    
+    return gdf
+
+
+
 #==============================================
 # fetch building for data acquistion 
 
@@ -431,14 +533,12 @@ if __name__ == "__main__":
     print(f"AOI bounding box: {bbox}")
     print("Fetching buildings from OSMnx...")
     gdf = fetch_buildings_from_bbox(bbox, provider='osmnx')
-    print(f"Fetched {len(gdf)} buildings. Clipping to AOI...")
-    gdf = filter_buildings_by_extent(gdf, aoi.geometry[0])
-    print(f"{len(gdf)} buildings after clipping. Enriching...")
+    print(f"Fetched {len(gdf)} buildings within bbox. Enriching...")
     gdf = enrich_buildings(gdf)
     # Drop centroid geometry column before saving
     if 'centroid' in gdf.columns:
         gdf = gdf.drop(columns=['centroid'])
-    output_path = base_dir / "outputs" / "buildings_aoi.geojson"
+    output_path = base_dir / "data" / "raw" / "vector" / "buildings" / "buildings_aoi.geojson"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     gdf.to_file(output_path, driver='GeoJSON')
     print(f"Saved {len(gdf)} buildings to {output_path}")

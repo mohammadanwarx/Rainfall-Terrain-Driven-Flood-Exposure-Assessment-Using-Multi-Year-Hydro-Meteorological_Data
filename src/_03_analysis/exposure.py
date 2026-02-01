@@ -465,3 +465,264 @@ def generate_building_exposure_summary(buildings_gdf: gpd.GeoDataFrame) -> Dict[
         )
     
     return summary
+
+
+# ===============================================
+# Raster-Vector Flood Exposure Assessment
+# ===============================================
+
+def assess_building_exposure_to_raster(buildings_gdf: gpd.GeoDataFrame,
+                                      flood_raster: np.ndarray,
+                                      raster_bounds,
+                                      raster_transform) -> gpd.GeoDataFrame:
+    """
+    Assess building exposure to flood raster using 5-level classification.
+    
+    METHOD:
+    -------
+    For each building centroid:
+    1. Identify corresponding raster pixel (using raster bounds & transform)
+    2. Read flood raster value at that pixel
+    3. Classify into 5 exposure levels based on FPI value thresholds
+    
+    EXPOSURE LEVELS (5-tier classification):
+    - No Exposure: FPI = 0
+    - Very Low: 0 < FPI < 0.15
+    - Medium: 0.15 ≤ FPI < 0.35
+    - High: 0.35 ≤ FPI < 0.65
+    - Very High: FPI ≥ 0.65
+    
+    Parameters
+    ----------
+    buildings_gdf : gpd.GeoDataFrame
+        Buildings with point or polygon geometries
+    flood_raster : np.ndarray
+        2D flood raster (e.g., FPI values [0-1])
+    raster_bounds : rasterio.coords.BoundingBox
+        Raster geographic extent (left, bottom, right, top)
+    raster_transform : rasterio.transform.Affine
+        Raster georeference transform
+        
+    Returns
+    -------
+    gpd.GeoDataFrame
+        Input GeoDataFrame with added columns:
+        - 'flood_raster_value': float, FPI value at building centroid
+        - 'exposure_class': str, one of ['No Exposure', 'Low', 'Medium', 'High', 'Very High']
+        - 'exposure_level': int, 0-4 (0=No Exposure, 4=Very High)
+        
+    Examples
+    --------
+    >>> buildings_exp = assess_building_exposure_to_raster(
+    ...     buildings_gdf, fpi_array, fpi_bounds, fpi_transform
+    ... )
+    >>> print(buildings_exp['exposure_class'].value_counts())
+    """
+    gdf = buildings_gdf.copy()
+    
+    # Convert to centroids if necessary
+    if gdf.geometry.type.isin(['Polygon', 'MultiPolygon']).any():
+        gdf['geometry'] = gdf.geometry.centroid
+        logger.info("Converted polygon geometries to centroids for raster sampling")
+    
+    # Initialize exposure columns - 5-level classification
+    gdf['flood_raster_value'] = np.nan
+    gdf['exposure_class'] = 'unknown'
+    gdf['exposure_level'] = -1
+    
+    # Sample raster at building locations
+    for idx, row in gdf.iterrows():
+        try:
+            # Get building centroid coordinates
+            x, y = row.geometry.x, row.geometry.y
+            
+            # Convert geographic coordinates to raster indices
+            px = int((x - raster_bounds.left) / raster_transform.a)
+            py = int((raster_bounds.top - y) / (-raster_transform.e))
+            
+            # Check bounds
+            if 0 <= py < flood_raster.shape[0] and 0 <= px < flood_raster.shape[1]:
+                value = float(flood_raster[py, px])
+                gdf.at[idx, 'flood_raster_value'] = value
+                
+                # 5-level exposure classification
+                if not np.isnan(value):
+                    if value == 0:
+                        gdf.at[idx, 'exposure_class'] = 'No Exposure'
+                        gdf.at[idx, 'exposure_level'] = 0
+                    elif value < 0.15:
+                        gdf.at[idx, 'exposure_class'] = 'Very Low'
+                        gdf.at[idx, 'exposure_level'] = 1
+                    elif value < 0.35:
+                        gdf.at[idx, 'exposure_class'] = 'Medium'
+                        gdf.at[idx, 'exposure_level'] = 2
+                    elif value < 0.65:
+                        gdf.at[idx, 'exposure_class'] = 'High'
+                        gdf.at[idx, 'exposure_level'] = 3
+                    else:
+                        gdf.at[idx, 'exposure_class'] = 'Very High'
+                        gdf.at[idx, 'exposure_level'] = 4
+            else:
+                gdf.at[idx, 'exposure_class'] = 'outside_raster'
+                gdf.at[idx, 'exposure_level'] = -1
+                
+        except Exception as e:
+            logger.warning(f"Error sampling raster at building {idx}: {e}")
+            gdf.at[idx, 'exposure_class'] = 'error'
+            gdf.at[idx, 'exposure_level'] = -2
+    
+    # Summarize exposure distribution
+    exposure_dist = gdf['exposure_class'].value_counts()
+    logger.info(f"Building exposure assessment complete. 5-level distribution:")
+    for exp_class, count in exposure_dist.items():
+        if exp_class not in ['outside_raster', 'error', 'unknown']:
+            pct = 100 * count / len(gdf[gdf['exposure_level'] >= 0])
+            logger.info(f"  {exp_class}: {count} ({pct:.1f}%)")
+    
+    return gdf
+
+
+def calculate_population_exposure(buildings_gdf: gpd.GeoDataFrame) -> Dict[str, float]:
+    """
+    Calculate population exposure metrics from buildings with population attribute.
+    
+    REQUIREMENTS:
+    - buildings_gdf must have 'population' column (derived from estimate_population_from_buildings)
+    - buildings_gdf must have 'exposed' column (from assess_building_exposure_to_raster)
+    
+    METRICS COMPUTED:
+    1. Total exposed population
+    2. Total population
+    3. Exposure rate (%)
+    4. Average population per exposed building
+    
+    Parameters
+    ----------
+    buildings_gdf : gpd.GeoDataFrame
+        Buildings with 'population' and 'exposed' columns
+        
+    Returns
+    -------
+    dict
+        Exposure metrics including:
+        - 'total_population': int
+        - 'exposed_population': int
+        - 'exposure_rate_percent': float
+        - 'unexposed_population': int
+        - 'avg_pop_per_exposed_building': float
+        
+    Raises
+    ------
+    KeyError
+        If required columns ('population', 'exposed') are missing
+        
+    Examples
+    --------
+    >>> pop_metrics = calculate_population_exposure(buildings_exp)
+    >>> print(f"Exposed population: {pop_metrics['exposed_population']}")
+    """
+    if 'population' not in buildings_gdf.columns:
+        raise KeyError("'population' column not found. Run estimate_population_from_buildings first.")
+    if 'exposed' not in buildings_gdf.columns:
+        raise KeyError("'exposed' column not found. Run assess_building_exposure_to_raster first.")
+    
+    # Calculate metrics
+    total_pop = int(buildings_gdf['population'].sum())
+    exposed_pop = int(buildings_gdf[buildings_gdf['exposed']]['population'].sum())
+    unexposed_pop = total_pop - exposed_pop
+    exposure_rate = (exposed_pop / total_pop * 100) if total_pop > 0 else 0
+    
+    exposed_buildings = buildings_gdf['exposed'].sum()
+    avg_pop_per_exposed = (exposed_pop / exposed_buildings) if exposed_buildings > 0 else 0
+    
+    metrics = {
+        'total_population': total_pop,
+        'exposed_population': exposed_pop,
+        'unexposed_population': unexposed_pop,
+        'exposure_rate_percent': exposure_rate,
+        'exposed_buildings': int(exposed_buildings),
+        'total_buildings': len(buildings_gdf),
+        'building_exposure_rate_percent': (exposed_buildings / len(buildings_gdf) * 100) if len(buildings_gdf) > 0 else 0,
+        'avg_pop_per_exposed_building': avg_pop_per_exposed
+    }
+    
+    logger.info(
+        f"Population exposure: {exposed_pop}/{total_pop} persons exposed "
+        f"({exposure_rate:.1f}%)"
+    )
+    
+    return metrics
+
+
+def generate_exposure_summary(buildings_gdf: gpd.GeoDataFrame,
+                              geometry_column: Optional[str] = None) -> pd.DataFrame:
+    """
+    Generate detailed exposure summary table.
+    
+    Produces a summary of exposure metrics with optional grouping by
+    administrative boundaries or analysis zones.
+    
+    Parameters
+    ----------
+    buildings_gdf : gpd.GeoDataFrame
+        Buildings with exposure attributes
+    geometry_column : str, optional
+        Column name for spatial grouping (e.g., 'admin_zone', 'district')
+        
+    Returns
+    -------
+    pd.DataFrame
+        Summary table with exposure metrics per zone or overall
+        
+    Examples
+    --------
+    >>> summary = generate_exposure_summary(buildings_exp, 'district')
+    >>> print(summary)
+    """
+    summary_data = []
+    
+    if geometry_column and geometry_column in buildings_gdf.columns:
+        # Group by geometry column
+        for zone, group in buildings_gdf.groupby(geometry_column):
+            row_dict = {
+                'zone': zone,
+                'total_buildings': len(group),
+                'exposed_buildings': int(group['exposed'].sum()),
+                'total_population': int(group['population'].sum()) if 'population' in group.columns else 0,
+                'exposed_population': int(group[group['exposed']]['population'].sum()) if 'population' in group.columns else 0,
+            }
+            
+            if row_dict['total_buildings'] > 0:
+                row_dict['building_exposure_pct'] = 100 * row_dict['exposed_buildings'] / row_dict['total_buildings']
+            else:
+                row_dict['building_exposure_pct'] = 0
+                
+            if row_dict['total_population'] > 0:
+                row_dict['population_exposure_pct'] = 100 * row_dict['exposed_population'] / row_dict['total_population']
+            else:
+                row_dict['population_exposure_pct'] = 0
+            
+            summary_data.append(row_dict)
+    else:
+        # Overall summary
+        row_dict = {
+            'zone': 'OVERALL',
+            'total_buildings': len(buildings_gdf),
+            'exposed_buildings': int(buildings_gdf['exposed'].sum()),
+            'total_population': int(buildings_gdf['population'].sum()) if 'population' in buildings_gdf.columns else 0,
+            'exposed_population': int(buildings_gdf[buildings_gdf['exposed']]['population'].sum()) if 'population' in buildings_gdf.columns else 0,
+        }
+        
+        if row_dict['total_buildings'] > 0:
+            row_dict['building_exposure_pct'] = 100 * row_dict['exposed_buildings'] / row_dict['total_buildings']
+        else:
+            row_dict['building_exposure_pct'] = 0
+            
+        if row_dict['total_population'] > 0:
+            row_dict['population_exposure_pct'] = 100 * row_dict['exposed_population'] / row_dict['total_population']
+        else:
+            row_dict['population_exposure_pct'] = 0
+        
+        summary_data.append(row_dict)
+    
+    return pd.DataFrame(summary_data)
