@@ -1,242 +1,444 @@
 """
-Building Data Processing Module
+Buildings Data Module
 
-This module provides functions for loading building footprints,
-filtering by AOI, and estimating population from building data.
+This module handles fetching building data from various APIs (primarily OSM/Overpass),
+processing building geometries, enriching with attributes for exposure analysis,
+and clipping to study areas.
+
+Key Features:
+- Multi-source building data fetching (Overpass API, osmnx)
+- Automatic building classification and enrichment
+- Study area clipping to focus analysis on relevant buildings
+- Multiple export formats (GeoJSON, GeoPackage, Shapefile, CSV)
 """
-
-import numpy as np
+import sys
+from pathlib import Path
+import requests
 import geopandas as gpd
 import pandas as pd
-from typing import Optional, Dict, Tuple
-from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from shapely.geometry import Point, Polygon, shape
+from shapely.ops import unary_union
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-def load_buildings_from_csv(filepath: str, crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
+class BuildingsAPIError(Exception):
+    """Custom exception for buildings API errors."""
+    pass
+
+
+def fetch_buildings_from_overpass(bbox: Tuple[float, float, float, float],
+                                 timeout: int = 60) -> gpd.GeoDataFrame:
     """
-    Load building data from CSV file (e.g., Google Open Buildings).
+    Fetch building data from OpenStreetMap Overpass API.
     
     Parameters
     ----------
-    filepath : str
-        Path to CSV file with building data
-    crs : str, optional
-        Coordinate reference system, default EPSG:4326
+    bbox : Tuple[float, float, float, float]
+        Bounding box as (south, west, north, east) in lat/lon
+    timeout : int, optional
+        Request timeout in seconds (default: 60)
         
     Returns
     -------
     gpd.GeoDataFrame
-        Building footprints as geodataframe
+        GeoDataFrame with building geometries and attributes
+        
+    Raises
+    ------
+    BuildingsAPIError
+        If API request fails or returns invalid data
+        
+    Notes
+    -----
+    Overpass API bbox format: (south, west, north, east)
     """
-    df = pd.read_csv(filepath)
+    # Convert bbox format if needed: (S, W, N, E)
+    south, west, north, east = bbox
     
-    # Assuming columns: latitude, longitude, area_in_meters, confidence
-    # Adjust column names based on actual data format
-    if 'geometry' in df.columns:
-        # If geometry already exists (WKT format)
-        from shapely import wkt
-        df['geometry'] = df['geometry'].apply(wkt.loads)
-        gdf = gpd.GeoDataFrame(df, crs=crs)
-    elif 'latitude' in df.columns and 'longitude' in df.columns:
-        # Create point geometry from coordinates
-        gdf = gpd.GeoDataFrame(
-            df, 
-            geometry=gpd.points_from_xy(df.longitude, df.latitude),
-            crs=crs
+    # Overpass QL query for buildings
+    overpass_query = f"""
+    [bbox:{south},{west},{north},{east}];
+    (
+        way["building"];
+        relation["building"];
+    );
+    out geom;
+    """
+    
+    overpass_url = "http://overpass-api.de/api/interpreter"
+    
+    try:
+        response = requests.post(
+            overpass_url,
+            data=overpass_query,
+            timeout=timeout
         )
-    else:
-        raise ValueError("CSV must contain 'geometry' or 'latitude'/'longitude' columns")
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise BuildingsAPIError(f"Failed to fetch from Overpass API: {str(e)}")
     
-    return gdf
+    # Parse OSM data
+    try:
+        import json
+        # Try alternative: use osmnx if available
+        try:
+            import osmnx as ox
+            gdf = ox.features_from_bbox(
+                (west, south, east, north), {'building': True}
+            )
+            gdf = gdf[gdf.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            return gdf
+        except ImportError:
+            # Fallback: manual parsing of Overpass JSON
+            data = response.json()
+            buildings = _parse_overpass_response(data)
+            if not buildings:
+                logger.warning("No buildings found in the specified area")
+                return gpd.GeoDataFrame(
+                    columns=['geometry', 'name', 'building_type'],
+                    crs='EPSG:4326'
+                )
+            gdf = gpd.GeoDataFrame(buildings, crs='EPSG:4326')
+            return gdf
+    except Exception as e:
+        raise BuildingsAPIError(f"Failed to parse Overpass response: {str(e)}")
 
 
-def filter_buildings_by_aoi(buildings: gpd.GeoDataFrame, 
-                            aoi: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+def _parse_overpass_response(data: Dict) -> List[Dict]:
     """
-    Filter buildings that fall within area of interest.
+    Parse Overpass JSON response and extract building features.
     
     Parameters
     ----------
-    buildings : gpd.GeoDataFrame
-        Building footprints
-    aoi : gpd.GeoDataFrame
-        Area of interest polygon
+    data : Dict
+        Parsed JSON response from Overpass API
         
     Returns
     -------
-    gpd.GeoDataFrame
-        Filtered buildings within AOI
+    List[Dict]
+        List of building feature dictionaries
     """
-    # Ensure same CRS
-    if buildings.crs != aoi.crs:
-        buildings = buildings.to_crs(aoi.crs)
+    buildings = []
     
-    # Spatial join to filter buildings within AOI
-    buildings_filtered = gpd.sjoin(buildings, aoi, predicate='within')
+    if 'elements' not in data:
+        return buildings
     
-    return buildings_filtered
-
-
-def estimate_population_from_buildings(buildings: gpd.GeoDataFrame,
-                                      method: str = "area_based",
-                                      persons_per_sqm: float = 0.05,
-                                      persons_per_building: float = 3.5) -> gpd.GeoDataFrame:
-    """
-    Estimate population from building footprints.
-    
-    Parameters
-    ----------
-    buildings : gpd.GeoDataFrame
-        Building footprints with area information
-    method : str, optional
-        Estimation method: 'area_based', 'count_based', or 'mixed'
-        - area_based: population = building_area * persons_per_sqm
-        - count_based: population = num_buildings * persons_per_building
-        - mixed: uses area if available, otherwise count
-    persons_per_sqm : float, optional
-        Average persons per square meter (default 0.05 = 50 persons per 1000 sqm)
-    persons_per_building : float, optional
-        Average persons per building (default 3.5)
-        
-    Returns
-    -------
-    gpd.GeoDataFrame
-        Buildings with estimated population column
-    """
-    buildings = buildings.copy()
-    
-    if method == "area_based":
-        if 'area_in_meters' not in buildings.columns:
-            # Calculate area from geometry if not provided
-            buildings['area_in_meters'] = buildings.geometry.area
-        
-        buildings['estimated_population'] = buildings['area_in_meters'] * persons_per_sqm
-        
-    elif method == "count_based":
-        buildings['estimated_population'] = persons_per_building
-        
-    elif method == "mixed":
-        if 'area_in_meters' in buildings.columns:
-            buildings['estimated_population'] = buildings['area_in_meters'] * persons_per_sqm
-        else:
-            buildings['estimated_population'] = persons_per_building
-    else:
-        raise ValueError("Method must be 'area_based', 'count_based', or 'mixed'")
+    # Process ways and relations
+    for element in data['elements']:
+        try:
+            if element.get('type') in ['way', 'relation']:
+                if 'geometry' not in element:
+                    continue
+                
+                coords = element['geometry']
+                if len(coords) < 3:
+                    continue
+                
+                geometry = Polygon([(c['lon'], c['lat']) for c in coords])
+                
+                tags = element.get('tags', {})
+                
+                building_dict = {
+                    'geometry': geometry,
+                    'osm_id': element.get('id'),
+                    'name': tags.get('name', ''),
+                    'building_type': tags.get('building', 'yes'),
+                    'levels': tags.get('building:levels', None),
+                    'height': tags.get('height', None),
+                }
+                
+                buildings.append(building_dict)
+        except Exception as e:
+            logger.debug(f"Failed to parse element {element.get('id')}: {str(e)}")
+            continue
     
     return buildings
 
 
-def aggregate_population_by_grid(buildings: gpd.GeoDataFrame,
-                                 grid_size: float,
-                                 crs: Optional[str] = None) -> gpd.GeoDataFrame:
+def fetch_buildings_from_bbox(bbox: Tuple[float, float, float, float],
+                             provider: str = 'overpass',
+                             **kwargs) -> gpd.GeoDataFrame:
     """
-    Aggregate building population to regular grid cells.
+    Fetch building data from specified provider using bounding box.
     
     Parameters
     ----------
-    buildings : gpd.GeoDataFrame
-        Buildings with estimated_population column
-    grid_size : float
-        Grid cell size in units of CRS (meters if metric)
-    crs : str, optional
-        CRS for grid creation, uses buildings CRS if None
+    bbox : Tuple[float, float, float, float]
+        Bounding box as (south, west, north, east)
+    provider : str, optional
+        Data provider: 'overpass' (default), 'osmnx'
+    **kwargs
+        Additional arguments to pass to provider-specific function
         
     Returns
     -------
     gpd.GeoDataFrame
-        Grid cells with aggregated population
+        Buildings GeoDataFrame
+        
+    Raises
+    ------
+    BuildingsAPIError
+        If provider is not supported or fetch fails
     """
-    from shapely.geometry import box
-    
-    if crs is None:
-        crs = buildings.crs
-    elif buildings.crs != crs:
-        buildings = buildings.to_crs(crs)
-    
-    # Get bounds
-    minx, miny, maxx, maxy = buildings.total_bounds
-    
-    # Create grid
-    cols = int(np.ceil((maxx - minx) / grid_size))
-    rows = int(np.ceil((maxy - miny) / grid_size))
-    
-    grid_cells = []
-    for i in range(cols):
-        for j in range(rows):
-            cell_minx = minx + i * grid_size
-            cell_miny = miny + j * grid_size
-            cell_maxx = cell_minx + grid_size
-            cell_maxy = cell_miny + grid_size
-            grid_cells.append(box(cell_minx, cell_miny, cell_maxx, cell_maxy))
-    
-    grid = gpd.GeoDataFrame({'geometry': grid_cells}, crs=crs)
-    grid['cell_id'] = range(len(grid))
-    
-    # Spatial join buildings to grid
-    joined = gpd.sjoin(buildings, grid, predicate='within')
-    
-    # Aggregate population by grid cell
-    pop_by_cell = joined.groupby('cell_id')['estimated_population'].sum()
-    
-    grid = grid.merge(pop_by_cell, left_on='cell_id', right_index=True, how='left')
-    grid['estimated_population'] = grid['estimated_population'].fillna(0)
-    
-    return grid
+    if provider.lower() == 'overpass':
+        return fetch_buildings_from_overpass(bbox, **kwargs)
+    elif provider.lower() == 'osmnx':
+        return _fetch_buildings_osmnx(bbox, **kwargs)
+    else:
+        raise BuildingsAPIError(f"Unsupported provider: {provider}")
 
 
-def calculate_building_statistics(buildings: gpd.GeoDataFrame) -> Dict[str, float]:
+def _fetch_buildings_osmnx(bbox: Tuple[float, float, float, float],
+                          **kwargs) -> gpd.GeoDataFrame:
     """
-    Calculate summary statistics for building dataset.
+    Fetch buildings using osmnx library.
     
     Parameters
     ----------
-    buildings : gpd.GeoDataFrame
-        Building footprints
+    bbox : Tuple[float, float, float, float]
+        Bounding box as (south, west, north, east)
+    **kwargs
+        Additional arguments for osmnx
         
     Returns
     -------
-    Dict[str, float]
-        Dictionary of statistics
+    gpd.GeoDataFrame
+        Buildings GeoDataFrame
     """
-    stats = {
-        'total_buildings': len(buildings),
-        'total_area_sqm': buildings.geometry.area.sum() if buildings.geometry.type[0] == 'Polygon' else buildings.get('area_in_meters', pd.Series([0])).sum(),
-    }
+    try:
+        import osmnx as ox
+    except ImportError:
+        raise BuildingsAPIError("osmnx not installed. Install with: pip install osmnx")
     
-    if 'estimated_population' in buildings.columns:
-        stats['total_population'] = buildings['estimated_population'].sum()
-        stats['avg_population_per_building'] = buildings['estimated_population'].mean()
+    south, west, north, east = bbox
     
-    if 'area_in_meters' in buildings.columns:
-        stats['avg_building_area'] = buildings['area_in_meters'].mean()
-        stats['median_building_area'] = buildings['area_in_meters'].median()
-    
-    return stats
+    try:
+        gdf = ox.features_from_bbox(
+            (west, south, east, north), {'building': True}
+        )
+        
+        # Filter to only polygon geometries
+        gdf = gdf[gdf.geometry.type.isin(['Polygon', 'MultiPolygon'])].copy()
+        
+        # Ensure CRS is set
+        if gdf.crs is None:
+            gdf.set_crs('EPSG:4326', inplace=True)
+        
+        return gdf
+    except Exception as e:
+        raise BuildingsAPIError(f"Failed to fetch buildings with osmnx: {str(e)}")
 
 
-def export_buildings(buildings: gpd.GeoDataFrame, 
-                    filepath: str,
-                    format: str = "geojson") -> None:
+def filter_buildings_by_extent(gdf: gpd.GeoDataFrame,
+                              extent_geom: Polygon) -> gpd.GeoDataFrame:
     """
-    Export building data to file.
+    Filter buildings to those within a specified extent/geometry (clips to study area).
     
     Parameters
     ----------
-    buildings : gpd.GeoDataFrame
-        Building footprints to export
-    filepath : str
-        Output file path
-    format : str, optional
-        Output format: 'geojson', 'shapefile', 'gpkg'
+    gdf : gpd.GeoDataFrame
+        Buildings GeoDataFrame
+    extent_geom : Polygon
+        Extent geometry for filtering/clipping
+        
+    Returns
+    -------
+    gpd.GeoDataFrame
+        Filtered and clipped buildings GeoDataFrame (buildings within extent)
+        
+    Notes
+    -----
+    This function performs a spatial clip operation, keeping only buildings
+    that intersect with the extent geometry. Buildings that cross the boundary
+    are clipped to the extent.
     """
-    filepath = Path(filepath)
-    filepath.parent.mkdir(parents=True, exist_ok=True)
+    if gdf.crs is None:
+        gdf = gdf.set_crs('EPSG:4326')
     
-    if format.lower() in ['geojson', 'json']:
-        buildings.to_file(filepath, driver='GeoJSON')
-    elif format.lower() in ['shapefile', 'shp']:
-        buildings.to_file(filepath, driver='ESRI Shapefile')
-    elif format.lower() in ['gpkg', 'geopackage']:
-        buildings.to_file(filepath, driver='GPKG')
+    # Ensure CRS compatibility
+    if isinstance(extent_geom, gpd.GeoSeries):
+        extent_geom = extent_geom[0]
+    
+    # Clip buildings to extent (keeps only buildings within the area)
+    clipped = gdf.clip(extent_geom)
+    
+    if len(clipped) == 0:
+        logger.warning(f"No buildings found within extent. Original: {len(gdf)}, After clip: {len(clipped)}")
     else:
-        raise ValueError(f"Unsupported format: {format}")
+        logger.info(f"Clipped buildings: {len(gdf)} → {len(clipped)} (study area only)")
+    
+    return clipped
+
+
+def enrich_buildings(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Enrich buildings GeoDataFrame with computed attributes.
+    
+    Parameters
+    ----------
+    gdf : gpd.GeoDataFrame
+        Buildings GeoDataFrame
+        
+    Returns
+    -------
+    gpd.GeoDataFrame
+        Enriched GeoDataFrame with additional columns
+    """
+    gdf = gdf.copy()
+
+    # Ensure 'building_type' column exists
+    if 'building_type' not in gdf.columns:
+        if 'building' in gdf.columns:
+            gdf['building_type'] = gdf['building']
+        else:
+            gdf['building_type'] = 'yes'
+
+    # Calculate building area
+    gdf['area_sqm'] = gdf.geometry.to_crs('EPSG:3857').area
+
+    # Calculate building centroid
+    gdf['centroid'] = gdf.geometry.centroid
+
+    # Convert levels to numeric if present
+    if 'levels' in gdf.columns:
+        gdf['levels'] = pd.to_numeric(gdf['levels'], errors='coerce')
+        gdf['levels'].fillna(1, inplace=True)
+
+    # Convert height to numeric if present
+    if 'height' in gdf.columns:
+        gdf['height'] = pd.to_numeric(gdf['height'], errors='coerce')
+        # Estimate height if not available but levels are
+        if 'levels' in gdf.columns:
+            gdf['height'].fillna(gdf['levels'] * 3.0, inplace=True)
+    else:
+        if 'levels' in gdf.columns:
+            gdf['height'] = gdf['levels'] * 3.0
+
+    # Assign building class based on building_type
+    gdf['building_class'] = gdf['building_type'].apply(_classify_building)
+
+    return gdf
+
+
+def _classify_building(building_type: str) -> str:
+    """
+    Classify building based on type.
+    
+    Parameters
+    ----------
+    building_type : str
+        Building type from OSM
+        
+    Returns
+    -------
+    str
+        Building class: 'residential', 'commercial', 'industrial', 'public', 'other'
+    """
+    if not isinstance(building_type, str):
+        return 'other'
+    
+    building_type = building_type.lower()
+    
+    residential = ['house', 'apartment', 'residential', 'dwelling', 'detached']
+    commercial = ['shop', 'commercial', 'retail', 'office', 'bank', 'supermarket']
+    industrial = ['industrial', 'warehouse', 'factory', 'plant']
+    public = ['school', 'hospital', 'church', 'government', 'civic', 'public']
+    
+    for keyword in residential:
+        if keyword in building_type:
+            return 'residential'
+    for keyword in commercial:
+        if keyword in building_type:
+            return 'commercial'
+    for keyword in industrial:
+        if keyword in building_type:
+            return 'industrial'
+    for keyword in public:
+        if keyword in building_type:
+            return 'public'
+    
+    return 'other'
+
+
+def save_buildings(gdf: gpd.GeoDataFrame, filepath: str) -> None:
+    """
+    Save buildings GeoDataFrame to file.
+    
+    Parameters
+    ----------
+    gdf : gpd.GeoDataFrame
+        Buildings GeoDataFrame
+    filepath : str
+        Output filepath (supports .geojson, .gpkg, .shp)
+    """
+    filepath_lower = filepath.lower()
+    
+    if filepath_lower.endswith('.geojson'):
+        gdf.to_file(filepath, driver='GeoJSON')
+    elif filepath_lower.endswith('.gpkg'):
+        gdf.to_file(filepath, driver='GPKG')
+    elif filepath_lower.endswith('.shp'):
+        gdf.to_file(filepath, driver='ESRI Shapefile')
+    else:
+        gdf.to_file(filepath)
+    
+    logger.info(f"Buildings saved to {filepath}")
+
+
+def load_buildings(filepath: str) -> gpd.GeoDataFrame:
+    """
+    Load buildings GeoDataFrame from file.
+    
+    Parameters
+    ----------
+    filepath : str
+        Input filepath
+        
+    Returns
+    -------
+    gpd.GeoDataFrame
+        Buildings GeoDataFrame
+    """
+    gdf = gpd.read_file(filepath)
+    logger.info(f"Loaded {len(gdf)} buildings from {filepath}")
+    return gdf
+
+#==============================================
+# fetch building for data acquistion 
+
+if __name__ == "__main__":
+    import geopandas as gpd
+    import sys
+    from pathlib import Path
+    print("Loading AOI shapefile...")
+    try:
+        base_dir = Path(__file__).parent.parent.parent
+    except NameError:
+        base_dir = Path.cwd()
+        # If not in project root, try to find 'data' folder up the tree
+        if not (base_dir / "data").exists():
+            for parent in [base_dir.parent, base_dir.parent.parent]:
+                if (parent / "data").exists():
+                    base_dir = parent
+                    break
+
+    aoi_path = base_dir / "data" / "raw" / "vector" / "AOI.shp"
+    aoi = gpd.read_file(aoi_path)
+    bbox = (aoi.bounds.miny[0], aoi.bounds.minx[0], aoi.bounds.maxy[0], aoi.bounds.maxx[0])
+    print(f"AOI bounding box: {bbox}")
+    print("Fetching buildings from OSMnx...")
+    gdf = fetch_buildings_from_bbox(bbox, provider='osmnx')
+    print(f"Fetched {len(gdf)} buildings. Clipping to AOI...")
+    gdf = filter_buildings_by_extent(gdf, aoi.geometry[0])
+    print(f"{len(gdf)} buildings after clipping. Enriching...")
+    gdf = enrich_buildings(gdf)
+    # Drop centroid geometry column before saving
+    if 'centroid' in gdf.columns:
+        gdf = gdf.drop(columns=['centroid'])
+    output_path = base_dir / "outputs" / "buildings_aoi.geojson"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    gdf.to_file(output_path, driver='GeoJSON')
+    print(f"Saved {len(gdf)} buildings to {output_path}")

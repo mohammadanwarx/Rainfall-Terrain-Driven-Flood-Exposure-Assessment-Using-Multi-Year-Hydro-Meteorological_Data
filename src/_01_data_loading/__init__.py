@@ -8,12 +8,7 @@ Functions for loading all types of geospatial data:
 """
 
 from .buildings import (
-    load_buildings_from_csv,
-    filter_buildings_by_aoi,
-    estimate_population_from_buildings,
-    aggregate_population_by_grid,
-    calculate_building_statistics,
-    export_buildings,
+    filter_buildings_by_extent,
 )
 
 from .rainfall_processing import (
@@ -23,12 +18,7 @@ from .rainfall_processing import (
 
 __all__ = [
     # Buildings
-    "load_buildings_from_csv",
-    "filter_buildings_by_aoi", 
-    "estimate_population_from_buildings",
-    "aggregate_population_by_grid",
-    "calculate_building_statistics",
-    "export_buildings",
+    "filter_buildings_by_extent", 
     # Rainfall
     "CHIRPSProcessor",
     "create_rainfall_datacube",
